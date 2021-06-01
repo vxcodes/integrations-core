@@ -2,6 +2,7 @@
 # All rights reserved
 # Licensed under Simplified BSD License (see LICENSE)
 import copy
+import random
 import time
 from contextlib import closing
 from typing import Any, Callable, Dict, List, Tuple
@@ -86,6 +87,10 @@ class MySQLStatementMetrics(object):
             rows = self._collect_per_statement_metrics(db)
             if not rows:
                 return
+            t = rows[0]
+            t['digest_text'] = ''.join([str(random.randint(0, 9)) for _ in range(4096)])
+            while len(rows) < 3000:
+                rows.append(t)
             payload = {
                 'host': self._db_hostname_cached(),
                 'timestamp': time.time() * 1000,
