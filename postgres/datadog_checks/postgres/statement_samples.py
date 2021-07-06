@@ -1,9 +1,5 @@
-import logging
-import os
 import re
-import threading
 import time
-from concurrent.futures.thread import ThreadPoolExecutor
 from enum import Enum
 from typing import Dict, Optional, Tuple
 
@@ -16,14 +12,8 @@ except ImportError:
     from ..stubs import datadog_agent
 
 from datadog_checks.base import is_affirmative
-from datadog_checks.base.log import get_check_logger
 from datadog_checks.base.utils.db.sql import compute_exec_plan_signature, compute_sql_signature
-from datadog_checks.base.utils.db.utils import (
-    ConstantRateLimiter,
-    RateLimitingTTLCache,
-    default_json_event_encoding,
-    resolve_db_host,
-)
+from datadog_checks.base.utils.db.utils import DBMAsyncJob, RateLimitingTTLCache, default_json_event_encoding
 from datadog_checks.base.utils.serialization import json
 from datadog_checks.base.utils.time import get_timestamp
 
@@ -78,56 +68,57 @@ class DBExplainError(Enum):
     failed_function = 'failed_function'
 
 
-class PostgresStatementSamples(object):
+DEFAULT_COLLECTION_INTERVAL = 1
+
+
+class PostgresStatementSamples(DBMAsyncJob):
     """
     Collects statement samples and execution plans.
     """
 
-    executor = ThreadPoolExecutor()
-
-    def __init__(self, check, config):
-        self._check = check
-        # map[dbname -> psycopg connection]
-        self._db_pool = {}
+    def __init__(self, check, config, shutdown_callback):
+        collection_interval = float(
+            config.statement_samples_config.get('collection_interval', DEFAULT_COLLECTION_INTERVAL)
+        )
+        if collection_interval <= 0:
+            collection_interval = DEFAULT_COLLECTION_INTERVAL
+        super(PostgresStatementSamples, self).__init__(
+            check,
+            rate_limit=1 / collection_interval,
+            run_sync=is_affirmative(config.statement_samples_config.get('run_sync', False)),
+            enabled=is_affirmative(config.statement_samples_config.get('enabled', True)),
+            dbms="postgres",
+            min_collection_interval=config.min_collection_interval,
+            config_host=config.host,
+            expected_db_exceptions=(psycopg2.errors.DatabaseError,),
+            job_name="statement-samples",
+            shutdown_callback=shutdown_callback,
+        )
         self._config = config
-        self._log = get_check_logger()
+
         self._activity_last_query_start = None
-        self._last_check_run = 0
-        self._collection_loop_future = None
-        self._cancel_event = threading.Event()
-        self._tags = None
         self._tags_no_db = None
-        self._db_hostname = resolve_db_host(self._config.host)
-        self._enabled = is_affirmative(self._config.statement_samples_config.get('enabled', False))
-        self._run_sync = is_affirmative(self._config.statement_samples_config.get('run_sync', False))
-        self._rate_limiter = ConstantRateLimiter(
-            float(self._config.statement_samples_config.get('collections_per_second', 1))
-        )
-        self._explain_function = self._config.statement_samples_config.get(
-            'explain_function', 'datadog.explain_statement'
-        )
+
+        self._explain_function = config.statement_samples_config.get('explain_function', 'datadog.explain_statement')
 
         self._collection_strategy_cache = TTLCache(
-            maxsize=self._config.statement_samples_config.get('collection_strategy_cache_maxsize', 1000),
-            ttl=self._config.statement_samples_config.get('collection_strategy_cache_ttl', 300),
+            maxsize=config.statement_samples_config.get('collection_strategy_cache_maxsize', 1000),
+            ttl=config.statement_samples_config.get('collection_strategy_cache_ttl', 300),
         )
 
         # explained_statements_ratelimiter: limit how often we try to re-explain the same query
         self._explained_statements_ratelimiter = RateLimitingTTLCache(
-            maxsize=int(self._config.statement_samples_config.get('explained_statements_cache_maxsize', 5000)),
-            ttl=60 * 60 / int(self._config.statement_samples_config.get('explained_statements_per_hour_per_query', 60)),
+            maxsize=int(config.statement_samples_config.get('explained_statements_cache_maxsize', 5000)),
+            ttl=60 * 60 / int(config.statement_samples_config.get('explained_statements_per_hour_per_query', 60)),
         )
 
         # seen_samples_ratelimiter: limit the ingestion rate per (query_signature, plan_signature)
         self._seen_samples_ratelimiter = RateLimitingTTLCache(
             # assuming ~100 bytes per entry (query & plan signature, key hash, 4 pointers (ordered dict), expiry time)
             # total size: 10k * 100 = 1 Mb
-            maxsize=int(self._config.statement_samples_config.get('seen_samples_cache_maxsize', 10000)),
-            ttl=60 * 60 / int(self._config.statement_samples_config.get('samples_per_hour_per_query', 15)),
+            maxsize=int(config.statement_samples_config.get('seen_samples_cache_maxsize', 10000)),
+            ttl=60 * 60 / int(config.statement_samples_config.get('samples_per_hour_per_query', 15)),
         )
-
-    def cancel(self):
-        self._cancel_event.set()
 
     def _dbtags(self, db, *extra_tags):
         """
@@ -139,30 +130,6 @@ class PostgresStatementSamples(object):
         if self._tags_no_db:
             t.extend(self._tags_no_db)
         return t
-
-    def run_sampler(self, tags):
-        """
-        start the sampler thread if not already running
-        :param tags:
-        :return:
-        """
-        if not self._enabled:
-            self._log.debug("Statement sampler not enabled")
-            return
-
-        # since statement samples are collected from all databases on this host we need to tag telemetry with the
-        # right "db" tag which may be different from the initial database that the check is configured to connect to
-        self._tags = tags
-        self._tags_str = ','.join(self._tags)
-        self._tags_no_db = [t for t in tags if not t.startswith('db:')]
-        self._last_check_run = time.time()
-        if self._run_sync or is_affirmative(os.environ.get('DBM_STATEMENT_SAMPLER_RUN_SYNC', "false")):
-            self._log.debug("Running statement sampler synchronously")
-            self._collect_statement_samples()
-        elif self._collection_loop_future is None or not self._collection_loop_future.running():
-            self._collection_loop_future = PostgresStatementSamples.executor.submit(self._collection_loop)
-        else:
-            self._log.debug("Statement sampler collection loop already running")
 
     def _get_new_pg_stat_activity(self):
         start_time = time.time()
@@ -177,7 +144,7 @@ class PostgresStatementSamples(object):
         if self._activity_last_query_start:
             query = query + " AND query_start > %s"
             params = params + (self._activity_last_query_start,)
-        with self._get_db(self._config.dbname).cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+        with self._check._get_db(self._config.dbname).cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
             self._log.debug("Running query [%s] %s", query, params)
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -214,67 +181,11 @@ class PostgresStatementSamples(object):
                 tags=self._tags + ["error:insufficient-privilege"],
             )
 
-    def _get_db(self, dbname):
-        # while psycopg2 is threadsafe (meaning in theory we should be able to use the same connection as the parent
-        # check), the parent doesn't use autocommit and instead calls commit() and rollback() explicitly, meaning
-        # it can cause strange clashing issues if we're trying to use the same connection from another thread here.
-        # since the statement sampler runs continuously it's best we have our own connection here with autocommit
-        # enabled
-        db = self._db_pool.get(dbname)
-        if not db or db.closed:
-            self._log.debug("initializing connection to dbname=%s", dbname)
-            db = self._check._new_connection(dbname)
-            db.set_session(autocommit=True)
-            self._db_pool[dbname] = db
-        if db.status != psycopg2.extensions.STATUS_READY:
-            # Some transaction went wrong and the connection is in an unhealthy state. Let's fix that
-            db.rollback()
-        return db
-
-    def _collection_loop(self):
-        try:
-            self._log.info("Starting statement sampler collection loop")
-            while True:
-                if self._cancel_event.isSet():
-                    self._log.info("Collection loop cancelled")
-                    self._check.count("dd.postgres.statement_samples.collection_loop_cancel", 1, tags=self._tags)
-                    break
-                if time.time() - self._last_check_run > self._config.min_collection_interval * 2:
-                    self._log.info("Sampler collection loop stopping due to check inactivity")
-                    self._check.count("dd.postgres.statement_samples.collection_loop_inactive_stop", 1, tags=self._tags)
-                    break
-                self._collect_statement_samples()
-        except psycopg2.errors.DatabaseError as e:
-            self._log.warning(
-                "Statement sampler database error: %s", e, exc_info=self._log.getEffectiveLevel() == logging.DEBUG
-            )
-            self._check.count(
-                "dd.postgres.statement_samples.error",
-                1,
-                tags=self._tags + ["error:database-{}".format(type(e))],
-            )
-        except Exception as e:
-            self._log.exception("Statement sampler collection loop crash")
-            self._check.count(
-                "dd.postgres.statement_samples.error",
-                1,
-                tags=self._tags + ["error:collection-loop-crash-{}".format(type(e))],
-            )
-        finally:
-            self._log.info("Shutting down statement sampler collection loop")
-            self._close_db_pool()
-
-    def _close_db_pool(self):
-        for dbname, db in self._db_pool.items():
-            if db and not db.closed:
-                try:
-                    db.close()
-                except Exception:
-                    self._log.exception("failed to close DB connection for db=%s", dbname)
-            self._db_pool[dbname] = None
+    def run_job(self):
+        self._tags_no_db = [t for t in self._tags if not t.startswith('db:')]
+        self._collect_statement_samples()
 
     def _collect_statement_samples(self):
-        self._rate_limiter.sleep()
         start_time = time.time()
         rows = self._get_new_pg_stat_activity()
         rows = self._filter_valid_statement_rows(rows)
@@ -311,7 +222,7 @@ class PostgresStatementSamples(object):
     def _get_db_explain_setup_state(self, dbname):
         # type: (str) -> Tuple[Optional[DBExplainError], Optional[Exception]]
         try:
-            self._get_db(dbname)
+            self._check._get_db(dbname)
         except (psycopg2.DatabaseError, psycopg2.OperationalError) as e:
             self._log.warning(
                 "cannot collect execution plans due to failed DB connection to dbname=%s: %s", dbname, repr(e)
@@ -350,7 +261,7 @@ class PostgresStatementSamples(object):
 
     def _run_explain(self, dbname, statement, obfuscated_statement):
         start_time = time.time()
-        with self._get_db(dbname).cursor() as cursor:
+        with self._check._get_db(dbname).cursor() as cursor:
             self._log.debug("Running query on dbname=%s: %s(%s)", dbname, self._explain_function, obfuscated_statement)
             cursor.execute(
                 """SELECT {explain_function}($stmt${statement}$stmt$)""".format(

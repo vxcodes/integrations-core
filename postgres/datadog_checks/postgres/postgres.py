@@ -2,6 +2,7 @@
 # All rights reserved
 # Licensed under Simplified BSD License (see LICENSE)
 import copy
+import threading
 from contextlib import closing
 
 import psycopg2
@@ -41,14 +42,19 @@ class PostgreSql(AgentCheck):
             )
         self._config = PostgresConfig(self.instance)
         self.metrics_cache = PostgresMetricsCache(self._config)
-        self.statement_metrics = PostgresStatementMetrics(self, self._config)
-        self.statement_samples = PostgresStatementSamples(self, self._config)
+        self.statement_metrics = PostgresStatementMetrics(self, self._config, shutdown_callback=self._close_db_pool)
+        self.statement_samples = PostgresStatementSamples(self, self._config, shutdown_callback=self._close_db_pool)
         self._relations_manager = RelationsManager(self._config.relations)
         self._clean_state()
         self.check_initializations.append(lambda: RelationsManager.validate_relations_config(self._config.relations))
 
+        # map[dbname -> psycopg connection]
+        self._db_pool = {}
+        self._db_pool_lock = threading.Lock()
+
     def cancel(self):
         self.statement_samples.cancel()
+        self.statement_metrics.cancel()
 
     def _clean_state(self):
         self.log.debug("Cleaning state")
@@ -290,6 +296,37 @@ class PostgreSql(AgentCheck):
         else:
             self.db = self._new_connection(self._config.dbname)
 
+    def _get_db(self, dbname):
+        """
+        Returns a memoized psycopg2 connection to `dbname` with autocommit
+        Threadsafe as long as no transactions are used
+        :param dbname:
+        :return: a psycopg2 connection
+        """
+        # TODO: migrate the rest of this check to use a connection from this pool
+        with self._db_pool_lock:
+            db = self._db_pool.get(dbname)
+            if not db or db.closed:
+                self.log.debug("initializing connection to dbname=%s", dbname)
+                db = self._new_connection(dbname)
+                db.set_session(autocommit=True)
+                self._db_pool[dbname] = db
+            if db.status != psycopg2.extensions.STATUS_READY:
+                # Some transaction went wrong and the connection is in an unhealthy state. Let's fix that
+                db.rollback()
+            return db
+
+    def _close_db_pool(self):
+        # TODO: add automatic aging out of connections after some time
+        with self._db_pool_lock:
+            for dbname, db in self._db_pool.items():
+                if db and not db.closed:
+                    try:
+                        db.close()
+                    except Exception:
+                        self._log.exception("failed to close DB connection for db=%s", dbname)
+                self._db_pool[dbname] = None
+
     def _collect_custom_queries(self, tags):
         """
         Given a list of custom_queries, execute each query and parse the result for metrics
@@ -398,11 +435,11 @@ class PostgreSql(AgentCheck):
             self._collect_stats(tags)
             self._collect_custom_queries(tags)
             if self._config.deep_database_monitoring:
-                self.statement_metrics.collect_per_statement_metrics(self.db, self.version, tags)
-                self.statement_samples.run_sampler(tags)
+                self.statement_metrics.run_job_loop(tags)
+                self.statement_samples.run_job_loop(tags)
 
         except Exception as e:
-            self.log.error("Unable to collect postgres metrics.")
+            self.log.exception("Unable to collect postgres metrics.")
             self._clean_state()
             self.db = None
             message = u'Error establishing connection to postgres://{}:{}/{}, error is {}'.format(
