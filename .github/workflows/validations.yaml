@@ -45,7 +45,7 @@ jobs:
 
     - name: Run manifest validation
       run: |
-        ddev validation manifest
+        ddev validate manifest
 
     - name: Run service checks validation
       run: |
