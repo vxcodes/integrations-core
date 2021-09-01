@@ -68,7 +68,7 @@ def manifest(ctx, check, fix):
             if not is_public:
                 annotate_warning(
                     manifest_file,
-                    "`is_public` is disabled, set to `True` if you want the integration documentation to be published."
+                    "`is_public` is disabled, set to `True` if you want the integration documentation to be published.",
                 )
 
             if file_failures > 0:
