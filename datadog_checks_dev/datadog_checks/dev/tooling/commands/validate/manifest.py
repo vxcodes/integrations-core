@@ -9,6 +9,7 @@ import click
 from datadog_checks.dev.tooling.manifest_validator.validator import get_all_validators
 
 from ....fs import file_exists, read_file, write_file
+from ...annotations import annotate_display_queue, annotate_error, annotate_warning
 from ...constants import get_root
 from ...testing import process_checks_option
 from ...utils import complete_valid_checks
@@ -52,6 +53,7 @@ def manifest(ctx, check, fix):
                 echo_info(f"{check_name}/manifest.json... ", nl=False)
                 echo_failure("FAILED")
                 echo_failure(f'  invalid json: {e}')
+                annotate_error(manifest_file, f"Invalid json: {e}")
                 continue
 
             for validator in all_validators:
@@ -61,12 +63,20 @@ def manifest(ctx, check, fix):
                 for msg_type, messages in validator.result.messages.items():
                     for message in messages:
                         display_queue.append((message_methods[msg_type], message))
+            # Check is_public
+            is_public = decoded.get("is_public")
+            if not is_public:
+                annotate_warning(
+                    manifest_file,
+                    "`is_public` is disabled, set to `True` if you want the integration documentation to be published."
+                )
 
             if file_failures > 0:
                 failed_checks += 1
                 # Display detailed info if file invalid
                 echo_info(f"{check_name}/manifest.json... ", nl=False)
                 echo_failure("FAILED")
+                annotate_display_queue(manifest_file, display_queue)
                 for display_func, message in display_queue:
                     display_func(message)
             elif not file_fixed:
