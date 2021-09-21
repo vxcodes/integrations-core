@@ -26,6 +26,7 @@ from datadog_checks.base.utils.time import get_timestamp
 from datadog_checks.dev import EnvVars, TempDir
 from datadog_checks.dev.ci import running_on_windows_ci
 from datadog_checks.dev.fs import read_file, write_file
+from datadog_checks.dev.http import MockResponse
 from datadog_checks.dev.utils import ON_WINDOWS
 
 pytestmark = pytest.mark.http
@@ -92,6 +93,39 @@ class TestTimeout:
         http = RequestsWrapper(instance, init_config)
 
         assert http.options['timeout'] == (16, 16)
+
+
+class TestRequestSize:
+    def test_config_default(self):
+        instance = {}
+        init_config = {}
+        http = RequestsWrapper(instance, init_config)
+
+        assert http.request_size == 16384
+
+    def test_config_correct(self):
+        instance = {'request_size': 0.5}
+        init_config = {}
+        http = RequestsWrapper(instance, init_config)
+
+        assert isinstance(http.request_size, int)
+        assert http.request_size == 512
+
+    def test_behavior_correct(self, mock_http_response):
+        instance = {'request_size': 0.5}
+        init_config = {}
+        http = RequestsWrapper(instance, init_config)
+
+        chunk_size = 512
+        payload_size = 1000
+        mock_http_response('a' * payload_size, normalize_content=False)
+
+        response = http.get('https://www.google.com')
+        chunks = list(response.iter_content())
+
+        assert len(chunks) == 2
+        assert len(chunks[0]) == chunk_size
+        assert len(chunks[1]) == payload_size - chunk_size
 
 
 class TestHeaders:
@@ -374,8 +408,14 @@ class TestAuth:
 
         assert os.environ.get('KRB5_CLIENT_KTNAME') is None
 
-        with mock.patch('requests.get', side_effect=lambda *args, **kwargs: os.environ.get('KRB5_CLIENT_KTNAME')):
-            assert http.get('https://www.google.com') == '/test/file'
+        with mock.patch(
+            'requests.get',
+            side_effect=lambda *args, **kwargs: MockResponse(
+                os.environ.get('KRB5_CLIENT_KTNAME'), normalize_content=False
+            ),
+        ):
+            response = http.get('https://www.google.com')
+            assert response.text == '/test/file'
 
         assert os.environ.get('KRB5_CLIENT_KTNAME') is None
 
@@ -387,8 +427,14 @@ class TestAuth:
 
         assert os.environ.get('KRB5CCNAME') is None
 
-        with mock.patch('requests.get', side_effect=lambda *args, **kwargs: os.environ.get('KRB5CCNAME')):
-            assert http.get('https://www.google.com') == '/test/file'
+        with mock.patch(
+            'requests.get',
+            side_effect=lambda *args, **kwargs: MockResponse(
+                os.environ.get('KRB5CCNAME'), normalize_content=False
+            ),
+        ):
+            response = http.get('https://www.google.com')
+            assert response.text == '/test/file'
 
         assert os.environ.get('KRB5CCNAME') is None
 
@@ -399,8 +445,14 @@ class TestAuth:
         http = RequestsWrapper(instance, init_config)
 
         with EnvVars({'KRB5CCNAME': 'old'}):
-            with mock.patch('requests.get', side_effect=lambda *args, **kwargs: os.environ.get('KRB5CCNAME')):
-                assert http.get('https://www.google.com') == '/test/file'
+            with mock.patch(
+                'requests.get',
+                side_effect=lambda *args, **kwargs: MockResponse(
+                    os.environ.get('KRB5CCNAME'), normalize_content=False
+                ),
+            ):
+                response = http.get('https://www.google.com')
+                assert response.text == '/test/file'
 
             assert os.environ.get('KRB5CCNAME') == 'old'
 
@@ -413,8 +465,14 @@ class TestAuth:
         with EnvVars({'KRB5_CLIENT_KTNAME': 'old'}):
             assert os.environ.get('KRB5_CLIENT_KTNAME') == 'old'
 
-            with mock.patch('requests.get', side_effect=lambda *args, **kwargs: os.environ.get('KRB5_CLIENT_KTNAME')):
-                assert http.get('https://www.google.com') == '/test/file'
+            with mock.patch(
+                'requests.get',
+                side_effect=lambda *args, **kwargs: MockResponse(
+                    os.environ.get('KRB5_CLIENT_KTNAME'), normalize_content=False
+                ),
+            ):
+                response = http.get('https://www.google.com')
+                assert response.text == '/test/file'
 
             assert os.environ.get('KRB5_CLIENT_KTNAME') == 'old'
 
